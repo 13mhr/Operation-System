@@ -6,6 +6,7 @@
 #include "proc.h"
 #include "defs.h"
 
+static char *states_str[] = {"unused", "sleeping", "runnable", "running", "zombie"};
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -294,7 +295,7 @@ void reparent(struct proc *p) {
 // Exit the current process.  Does not return.
 // An exited process remains in the zombie state
 // until its parent calls wait().
-void exit(int status) {
+/*void exit(int status) {
   struct proc *p = myproc();
 
   if (p == initproc) panic("init exiting");
@@ -352,11 +353,98 @@ void exit(int status) {
   // Jump into the scheduler, never to return.
   sched();
   panic("zombie exit");
-}
+}*/
+void exit(int status) {
+  struct proc *p = myproc();  // 获取当前进程
 
+  // 防止 init 进程退出
+  if (p == initproc) panic("init exiting");
+
+  // 关闭所有打开的文件
+  for (int fd = 0; fd < NOFILE; fd++) {
+    if (p->ofile[fd]) {
+      fileclose(p->ofile[fd]);
+      p->ofile[fd] = 0;
+    }
+  }
+
+  // 释放当前工作目录
+  begin_op();
+  if (p->cwd) {
+    iput(p->cwd);
+    p->cwd = 0;
+  }
+  end_op();
+
+  // 唤醒 init 进程，以便它可以接管孤儿进程
+  acquire(&initproc->lock);
+  wakeup1(initproc);
+  release(&initproc->lock);
+
+  // 获取当前进程的父进程指针
+  acquire(&p->lock);
+  struct proc *original_parent = p->parent;
+  release(&p->lock);
+
+  // 获取父进程的锁
+  if (original_parent) {
+    acquire(&original_parent->lock);
+  }
+
+  // 输出当前进程退出的信息
+  if (original_parent) {  // 确保 parent 不为 NULL
+    const char *parent_state = (original_parent->state >= 0 && original_parent->state < NELEM(states_str))
+                                   ? states_str[original_parent->state]
+                                   : "unknown";
+    exit_info("proc %d exit, parent pid %d, name %s, state %s\n", p->pid, original_parent->pid, original_parent->name,
+              parent_state);
+  } else {
+    exit_info("proc %d exit, parent pid 0, name none, state none\n", p->pid);
+  }
+
+  // 获取并输出子进程的信息
+  acquire(&p->lock);
+  int child_num = 0;
+  for (int i = 0; i < NPROC; i++) {
+    struct proc *child = &proc[i];
+    if (child->parent == p && child->state != UNUSED) {
+      const char *child_state =
+          (child->state >= 0 && child->state < NELEM(states_str)) ? states_str[child->state] : "unknown";
+      exit_info("proc %d exit, child %d, pid %d, name %s, state %s\n", p->pid, child_num, child->pid, child->name,
+                child_state);
+      child_num++;
+    }
+  }
+  release(&p->lock);
+
+  // 重新分配子进程给 init
+  reparent(p);
+
+  // 唤醒父进程，使其能够调用 wait() 回收子进程资源
+  if (original_parent) {
+    wakeup1(original_parent);
+  }
+
+  // 设置退出状态和状态为 ZOMBIE
+  acquire(&p->lock);
+  p->xstate = status;
+  p->state = ZOMBIE;
+  release(&p->lock);
+
+  // 释放父进程的锁
+  if (original_parent) {
+    release(&original_parent->lock);
+  }
+
+  // 进入调度器，停止当前进程的执行
+  acquire(&p->lock);
+  sched();
+  // 调用 sched() 后，进程不应再执行，如果执行到这里，说明发生了严重错误
+  panic("zombie exit");
+}
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
-int wait(uint64 addr) {
+/*int wait(uint64 addr) {
   struct proc *np;
   int havekids, pid;
   struct proc *p = myproc();
@@ -402,6 +490,54 @@ int wait(uint64 addr) {
 
     // Wait for a child to exit.
     sleep(p, &p->lock);  // DOC: wait-sleep
+  }
+}*/
+int wait(uint64 addr, int flags) {
+  struct proc *np;
+  int havekids, pid;
+  struct proc *p = myproc();
+
+  // 锁定当前进程，以防止子进程退出时丢失唤醒信号
+  acquire(&p->lock);
+
+  for (;;) {
+    // 遍历进程表，寻找已经退出的子进程
+    havekids = 0;
+    for (np = proc; np < &proc[NPROC]; np++) {
+      if (np->parent == p) {
+        acquire(&np->lock);
+        havekids = 1;
+        if (np->state == ZOMBIE) {
+          // 找到一个退出的子进程
+          pid = np->pid;
+          if (addr != 0 && copyout(p->pagetable, addr, (char *)&np->xstate, sizeof(np->xstate)) < 0) {
+            release(&np->lock);
+            release(&p->lock);
+            return -1;
+          }
+          freeproc(np);
+          release(&np->lock);
+          release(&p->lock);
+          return pid;
+        }
+        release(&np->lock);
+      }
+    }
+
+    // 如果没有子进程或当前进程被终止，释放锁并返回
+    if (!havekids || p->killed) {
+      release(&p->lock);
+      return -1;
+    }
+
+    // 如果是非阻塞模式，释放锁并返回 -1
+    if (flags == 1) {
+      release(&p->lock);
+      return -1;  // 表示没有找到处于ZOMBIE状态的子进程
+    }
+
+    // 阻塞等待子进程退出
+    sleep(p, &p->lock);  // sleep 会在内部释放锁，并在被唤醒时重新获取锁
   }
 }
 
