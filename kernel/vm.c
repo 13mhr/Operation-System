@@ -45,6 +45,34 @@ void kvminit() {
   kvmmap(TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
 }
 
+pagetable_t new_kvminit() {
+  pagetable_t k_pagetable = (pagetable_t)kalloc();
+  memset(k_pagetable, 0, PGSIZE);
+
+  // uart registers
+  new_kvmmap(k_pagetable, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+
+  // virtio mmio disk interface
+  new_kvmmap(k_pagetable, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+
+  // 此处不映射CLINT
+
+  // PLIC
+  new_kvmmap(k_pagetable, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+
+  // map kernel text executable and read-only.
+  new_kvmmap(k_pagetable, KERNBASE, KERNBASE, (uint64)etext - KERNBASE, PTE_R | PTE_X);
+
+  // map kernel data and the physical RAM we'll make use of.
+  new_kvmmap(k_pagetable, (uint64)etext, (uint64)etext, PHYSTOP - (uint64)etext, PTE_R | PTE_W);
+
+  // map the trampoline for trap entry/exit to
+  // the highest virtual address in the kernel.
+  new_kvmmap(k_pagetable, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+
+  return k_pagetable;  // 返回该内核独立页表的地址
+}
+
 // Switch h/w page table register to the kernel's page table,
 // and enable paging.
 void kvminithart() {
@@ -102,6 +130,13 @@ uint64 walkaddr(pagetable_t pagetable, uint64 va) {
 // does not flush TLB or enable paging.
 void kvmmap(uint64 va, uint64 pa, uint64 sz, int perm) {
   if (mappages(kernel_pagetable, va, sz, pa, perm) != 0) panic("kvmmap");
+}
+
+// add a mapping to the kernel page table for each proc.
+// only used when booting.
+// does not flush TLB or enable paging.
+void new_kvmmap(pagetable_t pagetable, uint64 va, uint64 pa, uint64 sz, int perm) {
+  if (mappages(pagetable, va, sz, pa, perm) != 0) panic("kvmmap");
 }
 
 // translate a kernel virtual address to
@@ -316,7 +351,12 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len) {
 // Copy len bytes to dst from virtual address srcva in a given page table.
 // Return 0 on success, -1 on error.
 int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
-  uint64 n, va0, pa0;
+  w_sstatus(r_sstatus() | SSTATUS_SUM);
+  int r = copyin_new(pagetable, dst, srcva, len);
+  w_sstatus(r_sstatus() & ~SSTATUS_SUM);
+  return r;
+
+  /*uint64 n, va0, pa0;
 
   while (len > 0) {
     va0 = PGROUNDDOWN(srcva);
@@ -330,7 +370,7 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
     dst += n;
     srcva = va0 + PGSIZE;
   }
-  return 0;
+  return 0;*/
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -338,7 +378,12 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
 // until a '\0', or max.
 // Return 0 on success, -1 on error.
 int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
-  uint64 n, va0, pa0;
+  w_sstatus(r_sstatus() | SSTATUS_SUM);
+  int r = copyinstr_new(pagetable, dst, srcva, max);
+  w_sstatus(r_sstatus() & ~SSTATUS_SUM);
+  return r;
+
+  /*uint64 n, va0, pa0;
   int got_null = 0;
 
   while (got_null == 0 && max > 0) {
@@ -369,7 +414,7 @@ int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
     return 0;
   } else {
     return -1;
-  }
+  }*/
 }
 
 // check if use global kpgtbl or not
@@ -378,4 +423,73 @@ int test_pagetable() {
   uint64 gsatp = MAKE_SATP(kernel_pagetable);
   printf("test_pagetable: %d\n", satp != gsatp);
   return satp != gsatp;
+}
+
+void vmreprint(pagetable_t pagetable, int level, uint64 index) {
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+    char rwxu[4] = "----";
+    if (pte & PTE_R) {
+      rwxu[0] = 'r';
+    }
+    if (pte & PTE_W) {
+      rwxu[1] = 'w';
+    }
+    if (pte & PTE_X) {
+      rwxu[2] = 'x';
+    }
+    if (pte & PTE_U) {
+      rwxu[3] = 'u';
+    }
+
+    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0) {  // 非叶节点
+      uint64 child = PTE2PA(pte);                                 // 将PTE转为为物理地址
+
+      for (int j = 0; j <= level; j++) {
+        if (j != level) {
+          printf("||   ");
+        } else {
+          printf("||");
+        }
+      }
+
+      index = index + i;
+      index = index << 9;
+      printf("idx: %d: pa: %p, flags: %s\n", i, child, rwxu);
+      vmreprint((pagetable_t)child, level + 1, index);
+      index = index >> 9;
+      index = index - i;
+    } else if (pte & PTE_V) {      // 叶子节点
+      uint64 child = PTE2PA(pte);  // 将PTE转为为物理地址
+      printf("||   ||   ||");
+      index = index + i;
+      index = index << 12;
+      printf("idx: %d: va: %p -> pa: %p, flags: %s\n", i, index, child, rwxu);
+      index = index >> 12;
+      index = index - i;
+    }
+  }
+}
+
+void vmprint(pagetable_t pagetable) {
+  printf("page table %p\n", pagetable);
+  uint64 index = 0x0000000000000000;
+  vmreprint(pagetable, 0, index);
+}
+
+// 实现内核页表直接共享用户页表的叶子页表
+// 经计算，96个次级页表项就能涵盖整个用户地址空间
+// (计算过程见实验报告)
+// 所以只需将用户页表的96个次级页表项复制到内核页表中
+void sync_pagetable(pagetable_t u_pgtbl, pagetable_t k_pgtbl) {
+  // 获取二级页表的起始物理地址
+  uint64 u_pgtbl_pa = PTE2PA(u_pgtbl[0]);
+  uint64 k_pgtbl_pa = PTE2PA(k_pgtbl[0]);
+
+  // 将用户页表的96个次级页表项复制到内核页表中
+  pte_t *p;
+  for (int i = 0; i < 96; i++) {
+    p = &(((pagetable_t)k_pgtbl_pa)[i]);
+    *p = ((pagetable_t)u_pgtbl_pa)[i];
+  }
 }
